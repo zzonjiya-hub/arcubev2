@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+<title>KSMS AR큐브 v2</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; font-family:-apple-system,'Malgun Gothic',sans-serif; background:#000; }
+  canvas { display:block; }
+  #arjs-video { position:absolute !important; top:0 !important; left:0 !important; }
+
+  #ui {
+    display:none;
+    position:fixed; top:0; left:0; right:0; z-index:10;
+    background:rgba(0,0,0,.55); color:#fff; padding:8px 10px;
+    font-size:12px; backdrop-filter:blur(4px);
+  }
+  #ui .row { display:flex; flex-wrap:wrap; gap:4px 10px; align-items:center; }
+  #calibBtn { background:#555; color:#fff; border:none; padding:6px 12px; border-radius:6px; font-size:13px; }
+  #hint { margin-top:4px; color:#ffd; font-size:11px; }
+  #detect { margin-top:2px; color:#8f8; font-size:11px; }
+  #calib { display:none; margin-top:6px; }
+  #calib button.face { background:rgba(255,255,255,.15); color:#fff; border:1px solid #888; padding:4px 8px; border-radius:6px; font-size:12px; margin:2px; }
+
+  /* 시작 화면 */
+  #start {
+    position:fixed; inset:0; z-index:30; background:#000;
+    display:flex; flex-direction:column; gap:18px;
+    align-items:center; justify-content:center;
+  }
+  #startGo {
+    width:128px; height:128px; border-radius:50%;
+    background:#fff; color:#000; border:none;
+    font-size:18px; font-weight:bold;
+  }
+  #startMsg { color:#fff; font-size:14px; max-width:80%; text-align:center; }
+
+  /* 팝업 */
+  #popup {
+    display:none; position:fixed; inset:0; z-index:20;
+    background:rgba(0,0,0,.85);
+  }
+  #popup img {
+    position:absolute; inset:0; margin:auto;
+    width:95vmin; height:95vmin; object-fit:contain;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <div class="row">
+    <button id="calibBtn">방향 교정</button>
+  </div>
+  <div id="hint">큐브를 카메라에 비추세요. 면을 터치하면 해당 이미지가 크게 보입니다.</div>
+  <div id="detect">감지: -</div>
+  <div id="calib"></div>
+</div>
+
+<div id="start">
+  <button id="startGo">시작하기</button>
+  <div id="startMsg"></div>
+</div>
+
+<div id="popup">
+  <img id="popupImg" alt="face">
+</div>
+
+<script type="importmap">
+{ "imports": { "threex": "./vendor/ar-threex.js", "three": "./vendor/three.module.min.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three'
+import { ArToolkitProfile, ArToolkitSource, ArToolkitContext, ArMarkerControls } from 'threex'
+
+ArToolkitContext.baseURL = './'
+
+const FACES = ['k','c','h','j','s','m']
+const faceTextures = {}   // face -> {texture, src}
+const faceMeshes = []     // raycast targets
+
+let renderer, scene, camera, arToolkitContext, arToolkitSource
+const onRenderFcts = []
+let popupFace = null
+
+window.addEventListener('error', e => {
+  document.getElementById('hint').textContent = '오류: ' + e.message + ' (' + (e.filename||'') + ':' + (e.lineno||'') + ')'
+})
+window.addEventListener('unhandledrejection', e => {
+  document.getElementById('hint').textContent = '오류: ' + (e.reason && (e.reason.name||'') + ' ' + (e.reason.message||e.reason))
+})
+
+// NOTE: initScene()/initUI()는 모든 선언 뒤 스크립트 끝에서 호출 (TDZ 방지)
+
+function initScene(){
+  renderer = new THREE.WebGLRenderer({ alpha:true })
+  renderer.setClearColor(new THREE.Color('lightgrey'), 0)
+  renderer.setSize(window.innerWidth, window.innerHeight)
+  renderer.domElement.style.position = 'fixed'
+  renderer.domElement.style.top = '0'
+  renderer.domElement.style.left = '0'
+  renderer.domElement.style.zIndex = '2'
+  document.body.appendChild(renderer.domElement)
+
+  scene = new THREE.Scene()
+  camera = new THREE.PerspectiveCamera()
+  camera.matrixAutoUpdate = false
+  scene.add(camera)
+
+  // 면 AR 내용 (ar/ 폴더 이미지: jpg 우선, 없으면 png)
+  for(const f of FACES){
+    const tex = new THREE.Texture()  // 빈 텍스처로 먼저 등록
+    faceTextures[f] = { texture: tex, src: null }
+    tryLoadFace(f, [`ar/${f}.jpg`, `ar/${f}.png`])
+  }
+
+  window.addEventListener('resize', onResize)
+}
+
+// 후보 URL을 순서대로 시도해서 처음 성공한 이미지를 면 텍스처로 등록
+function tryLoadFace(f, urls){
+  if(urls.length === 0) return
+  new THREE.TextureLoader().load(urls[0],
+    (loaded) => {
+      const t = faceTextures[f].texture
+      t.image = loaded.image
+      t.needsUpdate = true
+      faceTextures[f].src = urls[0]
+    },
+    undefined,
+    () => tryLoadFace(f, urls.slice(1))
+  )
+}
+
+let markerControlsList = []
+const markerGroups = {}   // face -> AR.js가 제어하는 그룹 (감지용)
+const markerToCube = {}   // face -> 마커 좌표계에서 큐브 중심까지의 변환
+const markerToCubeInv = {}  // face -> 큐브 중심에서 마커 좌표계로의 변환 (표시 자세용)
+let cubeGroup = null      // 6개 면을 하나의 입체로 표시 (보이지 않는 면까지 꺾인 채로 렌더링)
+const CUBE_SIDE = 1.5     // 실물의 1.5배 (실물을 감싸는 형태)
+const HOLD_MS = 2000
+const FADE_START = 1400  // 유지 후반부터 서서히 투명해짐 (가림 대응)
+const FACE_SIZE = CUBE_SIDE
+
+// 전개도 접기 기준 배치 (그림 바깥向き로 접었을 때)
+// 위치: s=앞(+Z), h=뒤(-Z), j=왼쪽(-X), c=오른쪽(+X), k=위(+Y), m=아래(-Y)
+// 글자 위쪽: 밴드 4면=+Y(위), k=-Z(뒤), m=+Z(앞)
+const CUBE_FACES = {
+  s: { n: [0,0,1],  u: [0,1,0]  },
+  h: { n: [0,0,-1], u: [0,1,0]  },
+  j: { n: [-1,0,0], u: [0,1,0]  },
+  c: { n: [1,0,0],  u: [0,1,0]  },
+  k: { n: [0,1,0],  u: [0,0,-1] },
+  m: { n: [0,-1,0], u: [0,0,1]  },
+}
+function v3(a){ return new THREE.Vector3(a[0], a[1], a[2]) }
+// 방향 식별이 확실한 면 (180도 회전대칭이 없어 추적 기준에 안전)
+const ASYM_FACES = ['k', 'c', 'j', 'm']
+
+// 면 이미지 회전값 (0~3, 90°씩. 추적 변환+표시 함께 반영, 일관성 유지)
+let faceRot = { k:0, c:0, h:0, j:0, s:0, m:0 }
+try {
+  const saved = JSON.parse(localStorage.getItem('ksms2cube_rot') || '{}')
+  for(const f of FACES){ if(saved[f] >= 0 && saved[f] <= 3) faceRot[f] = saved[f] }
+} catch(_) {}
+function faceUp(f){
+  const { n, u } = CUBE_FACES[f]
+  let N = v3(n), U = v3(u)
+  for(let i = 0; i < faceRot[f]; i++) U = new THREE.Vector3().crossVectors(N, U)
+  return { N, U }
+}
+function applyTextureRot(f){
+  const t = faceTextures[f] && faceTextures[f].texture
+  if(!t) return
+  t.center.set(0.5, 0.5)
+  t.rotation = -faceRot[f] * Math.PI / 2
+}
+function calcMarkerToCube(f){
+  const { N, U } = faceUp(f)
+  const Zm = U.clone().negate()
+  const Xm = new THREE.Vector3().crossVectors(N, Zm)
+  const m = new THREE.Matrix4().makeBasis(Xm, N, Zm)
+  m.setPosition(N.clone().multiplyScalar(0.5))  // 실물 면 중심 (마커 크기 1.0 기준)
+  markerToCube[f] = m  // marker 좌표계 -> 큐브 중심 좌표계
+  markerToCubeInv[f] = m.clone().invert()  // 큐브 중심 -> marker 좌표계
+  // 표시 자세 = Q(marker->world) x markerToCubeInv (cube->world). 정방향이 아님에 주의!
+}
+
+function setupMarkers(){
+  for(const f of FACES){
+    const markerGroup = new THREE.Group()
+    markerGroup.visible = false
+    scene.add(markerGroup)
+    markerGroups[f] = markerGroup
+
+    const controls = new ArMarkerControls(arToolkitContext, markerGroup, {
+      type: 'pattern',
+      patternUrl: `markers/${f}.patt`,
+      size: 1,
+      smooth: true,
+      smoothCount: 3,
+      smoothTolerance: 0.01,
+      smoothThreshold: 2,
+    })
+    markerControlsList.push(controls)
+    calcMarkerToCube(f)
+  }
+
+  // 표시용 입체: 6개 면을 하나의 큐브로 구성.
+  // 각 면 평면은 큐브 로컬의 고정 위치에 있고, 큐브 전체 자세만 갱신됨.
+  // (면마다 따로 붙이는 방식이 아니라 하나의 강체로 움직임)
+  cubeGroup = new THREE.Group()
+  cubeGroup.visible = false
+  scene.add(cubeGroup)
+  for(const f of FACES){
+    const { n, u } = CUBE_FACES[f]
+    const N = v3(n), U = v3(u)
+    const Xt = new THREE.Vector3().crossVectors(U, N)
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(FACE_SIZE, FACE_SIZE),
+      new THREE.MeshBasicMaterial({ map: faceTextures[f].texture, transparent: true })
+    )
+    mesh.material.side = THREE.FrontSide
+    const bm = new THREE.Matrix4().makeBasis(Xt, U, N)
+    bm.setPosition(N.clone().multiplyScalar(CUBE_SIDE / 2))
+    mesh.applyMatrix4(bm)
+    mesh.userData.face = f
+    cubeGroup.add(mesh)
+    faceMeshes.push(mesh)
+    applyTextureRot(f)
+  }
+
+  // 매 프레임: 보이는 면들로 큐브 자세 융합 (면적 가중 평균)
+  // - 비대칭 문양 면(k/c/j/m)을 우선 사용 (180도 뒤집힘 오인식 방지)
+  // - s/h는 다른 면이 하나도 안 보일 때만 사용
+  // - 표시 자세 D = Q(marker->world) x inv(M) (cube->world). 정방향 곱이 아님!
+  const tmpM = new THREE.Matrix4()
+  const tmpP = new THREE.Vector3()
+  const tmpQ = new THREE.Quaternion()
+  const tmpS = new THREE.Vector3()
+  const tmpV = new THREE.Vector3()
+  const fuse = FACES.map(() => ({ p: new THREE.Vector3(), q: new THREE.Quaternion(), a: 0 }))
+  const fusedP = new THREE.Vector3()
+  const fusedQ = new THREE.Quaternion()
+  let cubeLastSeen = 0
+  const quadArea = (mg) => {
+    mg.updateMatrixWorld()
+    let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9
+    for(const [cx, cz] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]){
+      tmpV.set(cx, 0, cz).applyMatrix4(mg.matrixWorld)
+        .applyMatrix4(camera.matrixWorldInverse).applyMatrix4(camera.projectionMatrix)
+      if(tmpV.x < minX) minX = tmpV.x
+      if(tmpV.x > maxX) maxX = tmpV.x
+      if(tmpV.y < minY) minY = tmpV.y
+      if(tmpV.y > maxY) maxY = tmpV.y
+    }
+    return (maxX - minX) * (maxY - minY)
+  }
+  onRenderFcts.push(() => {
+    const now = performance.now()
+    let pool = FACES.filter(f => markerGroups[f].visible)
+    const asym = pool.filter(f => ASYM_FACES.includes(f))
+    if(asym.length > 0) pool = asym
+    let n = 0, totalW = 0, best = 0, driver = null
+    for(let i = 0; i < FACES.length; i++){
+      const f = FACES[i]
+      if(!pool.includes(f)) continue
+      const mg = markerGroups[f]
+      mg.updateMatrix()
+      tmpM.compose(mg.position, mg.quaternion, mg.scale).multiply(markerToCubeInv[f])
+      tmpM.decompose(tmpP, tmpQ, tmpS)
+      const a = quadArea(mg)
+      fuse[i].p.copy(tmpP)
+      fuse[i].q.copy(tmpQ)
+      fuse[i].a = a
+      totalW += a
+      if(a > best){ best = a; driver = f }
+      n++
+    }
+    if(n > 0 && totalW > 0){
+      fusedP.set(0, 0, 0)
+      fusedQ.set(0, 0, 0, 0)
+      const ref = fuse[FACES.indexOf(driver)].q
+      for(let i = 0; i < FACES.length; i++){
+        if(fuse[i].a <= 0) continue
+        const w = fuse[i].a / totalW
+        fusedP.addScaledVector(fuse[i].p, w)
+        let s = 1
+        if(fuse[i].q.x * ref.x + fuse[i].q.y * ref.y + fuse[i].q.z * ref.z + fuse[i].q.w * ref.w < 0) s = -1
+        fusedQ.x += s * w * fuse[i].q.x
+        fusedQ.y += s * w * fuse[i].q.y
+        fusedQ.z += s * w * fuse[i].q.z
+        fusedQ.w += s * w * fuse[i].q.w
+      }
+      fusedQ.normalize()
+      for(let i = 0; i < FACES.length; i++) fuse[i].a = 0
+      cubeGroup.position.copy(fusedP)
+      cubeGroup.quaternion.copy(fusedQ)
+      cubeGroup.visible = true
+      for(const m of faceMeshes) m.material.opacity = 1
+      cubeLastSeen = now
+    } else if(cubeGroup.visible){
+      const age = now - cubeLastSeen
+      if(age > HOLD_MS){
+        cubeGroup.visible = false
+      } else if(age > FADE_START){
+        const o = 1 - (age - FADE_START) / (HOLD_MS - FADE_START)
+        for(const m of faceMeshes) m.material.opacity = o
+      }
+    }
+  })
+
+  // 진단 오버레이 (?diag=1): 감지된 사각형 표시
+  if(new URLSearchParams(location.search).has('diag')){
+    const dc = document.createElement('canvas')
+    dc.id = 'diagCanvas'
+    dc.style.cssText = 'position:fixed;top:0;left:0;z-index:5;pointer-events:none;'
+    document.body.appendChild(dc)
+    const dctx = dc.getContext('2d')
+    const corner = new THREE.Vector3()
+    const proj = (v) => {
+      corner.copy(v).applyMatrix4(camera.matrixWorldInverse).applyMatrix4(camera.projectionMatrix)
+      return [
+        (corner.x * 0.5 + 0.5) * dc.width,
+        (-corner.y * 0.5 + 0.5) * dc.height,
+      ]
+    }
+    const poly = (pts, color, label) => {
+      dctx.strokeStyle = color; dctx.lineWidth = 3
+      dctx.beginPath()
+      pts.forEach((p, i) => { const [x, y] = proj(p); i ? dctx.lineTo(x, y) : dctx.moveTo(x, y) })
+      dctx.closePath(); dctx.stroke()
+      if(label){
+        const [x, y] = proj(pts[0])
+        dctx.fillStyle = color; dctx.font = 'bold 28px sans-serif'
+        dctx.fillText(label, x + 6, y - 6)
+      }
+    }
+    const seg = (a, b, color) => {
+      const [x1, y1] = proj(a), [x2, y2] = proj(b)
+      dctx.strokeStyle = color; dctx.lineWidth = 2
+      dctx.beginPath(); dctx.moveTo(x1, y1); dctx.lineTo(x2, y2); dctx.stroke()
+    }
+    const E = CUBE_SIDE / 2
+    const cubeCorners = []
+    for(const sx of [-1, 1]) for(const sy of [-1, 1]) for(const sz of [-1, 1])
+      cubeCorners.push(new THREE.Vector3(sx * E, sy * E, sz * E))
+    onRenderFcts.push(() => {
+      dc.width = renderer.domElement.width
+      dc.height = renderer.domElement.height
+      dc.style.width = renderer.domElement.style.width
+      dc.style.height = renderer.domElement.style.height
+      dc.style.marginLeft = renderer.domElement.style.marginLeft
+      dc.style.marginTop = renderer.domElement.style.marginTop
+      dctx.clearRect(0, 0, dc.width, dc.height)
+      for(const f of FACES){
+        const mg = markerGroups[f]
+        if(!mg || !mg.visible) continue
+        mg.updateMatrixWorld()
+        const q = [
+          new THREE.Vector3(-0.5, 0, -0.5).applyMatrix4(mg.matrixWorld),
+          new THREE.Vector3(0.5, 0, -0.5).applyMatrix4(mg.matrixWorld),
+          new THREE.Vector3(0.5, 0, 0.5).applyMatrix4(mg.matrixWorld),
+          new THREE.Vector3(-0.5, 0, 0.5).applyMatrix4(mg.matrixWorld),
+        ]
+        poly(q, '#ff0000', f)
+      }
+      if(typeof cubeGroup !== 'undefined' && cubeGroup && cubeGroup.visible){
+        cubeGroup.updateMatrixWorld()
+        const w = cubeCorners.map(p => p.clone().applyMatrix4(cubeGroup.matrixWorld))
+        const idx = (x, y, z) => x * 4 + y * 2 + z
+        for(const a of [0, 1]) for(const b of [0, 1]){
+          seg(w[idx(a, b, 0)], w[idx(a, b, 1)], '#0066ff')
+          seg(w[idx(a, 0, b)], w[idx(a, 1, b)], '#0066ff')
+          seg(w[idx(0, a, b)], w[idx(1, a, b)], '#0066ff')
+        }
+      }
+    })
+  }
+}
+
+function initUI(){
+  document.getElementById('startGo').addEventListener('click', () => {
+    document.getElementById('start').style.display = 'none'
+    document.getElementById('ui').style.display = 'none'
+    document.getElementById('startMsg').textContent = ''
+    startCamera()
+  })
+
+  const popup = document.getElementById('popup')
+  popup.addEventListener('click', e => {
+    if(e.target.id !== 'popupImg') closePopup()
+  })
+
+  renderer.domElement.addEventListener('touchstart', onTap, {passive:false})
+  renderer.domElement.addEventListener('mousedown', onTap)
+
+  // 방향 교정 UI: 어긋난 면 버튼을 누르면 90°씩 회전 (브라우저에 저장됨)
+  const calibDiv = document.getElementById('calib')
+  document.getElementById('calibBtn').addEventListener('click', () => {
+    calibDiv.style.display = calibDiv.style.display === 'block' ? 'none' : 'block'
+  })
+  const refreshCalibBtns = () => {
+    calibDiv.innerHTML = ''
+    for(const f of FACES){
+      const b = document.createElement('button')
+      b.className = 'face'
+      b.textContent = `${f} (${faceRot[f] * 90}°)`
+      b.addEventListener('click', () => {
+        faceRot[f] = (faceRot[f] + 1) % 4
+        try { localStorage.setItem('ksms2cube_rot', JSON.stringify(faceRot)) } catch(_) {}
+        applyTextureRot(f)
+        calcMarkerToCube(f)
+        refreshCalibBtns()
+      })
+      calibDiv.appendChild(b)
+    }
+  }
+  refreshCalibBtns()
+
+  const detected = new Set()
+  const parseFace = (e) => {
+    try {
+      const m = e.detail && e.detail.name && e.detail.name()
+      const f = m && m.match(/([kchjsm])\.patt/)
+      return f && f[1]
+    } catch(_) { return null }
+  }
+  window.addEventListener('markerFound', e => {
+    const f = parseFace(e)
+    if (f) { detected.add(f); updateDetected() }
+  })
+  window.addEventListener('markerLost', e => {
+    const f = parseFace(e)
+    if (f) { detected.delete(f); updateDetected() }
+  })
+  function updateDetected(){
+    document.getElementById('detect').textContent =
+      '감지: ' + (FACES.filter(f => detected.has(f)).join(' ') || '-') +
+      ' | 교정: ' + FACES.map(f => f + faceRot[f]).join(' ')
+  }
+}
+
+async function startCamera(){
+  try {
+    const s = await Promise.race([
+      navigator.mediaDevices.getUserMedia({ video: true }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('시간 초과 - 카메라를 찾지 못했습니다. 다른 앱에서 카메라를 사용 중이면 종료하세요.')), 6000))
+    ])
+    s.getTracks().forEach(t => t.stop())
+  } catch (err) {
+    const msg = '카메라 오류: ' + (err.name || '') + ' ' + err.message
+    document.getElementById('hint').textContent = msg
+    const sm = document.getElementById('startMsg')
+    if(sm) sm.textContent = msg
+    document.getElementById('start').style.display = 'flex'
+    return
+  }
+  const profile = new ArToolkitProfile()
+  profile.sourceWebcam()
+  arToolkitSource = new ArToolkitSource(profile.sourceParameters)
+  arToolkitSource.init(() => {
+    const tryResize = () => {
+      if (arToolkitSource.domElement.videoWidth) onResize()
+      else setTimeout(tryResize, 200)
+    }
+    arToolkitSource.domElement.addEventListener('canplay', () => {
+      initARContext()
+      tryResize()
+    })
+    tryResize()
+  })
+}
+
+function initARContext(){
+  arToolkitContext = new ArToolkitContext({
+    cameraParametersUrl: 'data/camera_para.dat',
+    canvasWidth: 640,
+    canvasHeight: 480,
+    patternRatio: 0.8,
+    debug: new URLSearchParams(location.search).has('debug'),
+  })
+  arToolkitContext.init(() => {
+    camera.projectionMatrix.copy(arToolkitContext.getProjectionMatrix())
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert()
+    setupMarkers()
+  })
+
+  onRenderFcts.push(() => {
+    if (arToolkitContext && arToolkitSource && arToolkitSource.ready) {
+      arToolkitContext.update(arToolkitSource.domElement)
+    }
+  })
+
+  animate()
+}
+
+function onResize(){
+  if(!arToolkitSource) return
+  arToolkitSource.onResizeElement()
+  arToolkitSource.copyElementSizeTo(renderer.domElement)
+  if (arToolkitContext && arToolkitContext.arController !== null) {
+    arToolkitSource.copyElementSizeTo(arToolkitContext.arController.canvas)
+  }
+}
+
+function animate(){
+  requestAnimationFrame(animate)
+  const delta = 0.016
+  onRenderFcts.forEach(f => f(delta))
+  renderer.render(scene, camera)
+}
+
+const raycaster = new THREE.Raycaster()
+const tapTimes = []
+function onTap(e){
+  const now = performance.now()
+  while(tapTimes.length && now - tapTimes[0] > 600) tapTimes.shift()
+  tapTimes.push(now)
+  if(tapTimes.length >= 3){
+    // 세 번 연속 터치: 설정 표시 토글 (방향 교정용)
+    tapTimes.length = 0
+    const ui = document.getElementById('ui')
+    ui.style.display = (ui.style.display === 'block') ? 'none' : 'block'
+    return
+  }
+  if(popupFace) return
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY
+  const ndcX = (clientX / window.innerWidth) * 2 - 1
+  const ndcY = -(clientY / window.innerHeight) * 2 + 1
+  const origin = new THREE.Vector3(0,0,0)
+  const dir = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(camera).sub(origin).normalize()
+  camera.updateMatrixWorld()
+  raycaster.set(origin, dir)
+  const hits = raycaster.intersectObjects(faceMeshes, false)
+  for(const h of hits){
+    if(h.object.parent.visible && faceTextures[h.object.userData.face].src){
+      openPopup(h.object.userData.face)
+      break
+    }
+  }
+}
+
+function openPopup(face){
+  popupFace = face
+  document.getElementById('popupImg').src = faceTextures[face].src
+  document.getElementById('popup').style.display = 'block'
+}
+function closePopup(){
+  popupFace = null
+  document.getElementById('popup').style.display = 'none'
+}
+
+if(location.protocol === 'file:'){
+  document.getElementById('startMsg').textContent = '오류: 파일을 직접 열면 AR이 동작하지 않습니다. https://localhost:8445 로 접속하세요.'
+}
+
+initScene()
+initUI()
+</script>
+</body>
+</html>
