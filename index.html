@@ -155,8 +155,6 @@ const CUBE_FACES = {
   m: { n: [0,-1,0], u: [0,0,1]  },
 }
 function v3(a){ return new THREE.Vector3(a[0], a[1], a[2]) }
-// 방향 식별이 확실한 면 (180도 회전대칭이 없어 추적 기준에 안전)
-const ASYM_FACES = ['k', 'c', 'j', 'm']
 
 // 면 이미지 회전값 (0~3, 90°씩. 추적 변환+표시 함께 반영, 일관성 유지)
 let faceRot = { k:0, c:0, h:0, j:0, s:0, m:0 }
@@ -231,19 +229,41 @@ function setupMarkers(){
     applyTextureRot(f)
   }
 
-  // 매 프레임: 보이는 면들로 큐브 자세 융합 (면적 가중 평균)
-  // - 비대칭 문양 면(k/c/j/m)을 우선 사용 (180도 뒤집힘 오인식 방지)
-  // - s/h는 다른 면이 하나도 안 보일 때만 사용
-  // - 표시 자세 D = Q(marker->world) x inv(M) (cube->world). 정방향 곱이 아님!
+  // 매 프레임: 보이는 모든 면으로 큐브 자세 융합 (면적 가중 평균)
+  // - 정면(면적 큼)이 주도하므로 비스듬한 옆면 때문에 쏠리지 않음
+  // - 뒤집힘 감시: 직전 자세에서 75도+ 급변한 면은 이번 프레임 제외
+  //   (s/h 문양이 180도 대칭이라 순간 뒤집혀 인식되는 경우 방지)
+  //   전부 제외됐는데 보이는 면이 있으면 최대 면 1개는 강제 사용
   const tmpM = new THREE.Matrix4()
   const tmpP = new THREE.Vector3()
   const tmpQ = new THREE.Quaternion()
   const tmpS = new THREE.Vector3()
   const tmpV = new THREE.Vector3()
-  const fuse = FACES.map(() => ({ p: new THREE.Vector3(), q: new THREE.Quaternion(), a: 0 }))
+  const fuse = FACES.map(() => ({ p: new THREE.Vector3(), q: new THREE.Quaternion(), a: 0, ok: false }))
+  // 뒤집힘 감시용: 면별 마지막 안정 자세 (s/h 180도 대칭 문양의 순간 뒤집힘 제외용)
+  const faceBase = FACES.map(() => ({ q: new THREE.Quaternion(), t: 0, init: false }))
   const fusedP = new THREE.Vector3()
   const fusedQ = new THREE.Quaternion()
   let cubeLastSeen = 0
+  // 재인식 블렌드: 놓쳤다 다시 잡히면 얼어있던 자세에서 실측 자세까지
+  // 최단 경로로 부드럽게 이동 (위치 직선 + 방향 slerp 최단호)
+  const BLEND_MS = 200
+  let blending = false
+  let blendStart = 0
+  let wasDetected = false
+  const blendFromP = new THREE.Vector3()
+  const blendFromQ = new THREE.Quaternion()
+  // 움직임 예측용 상태 (가려져서 감지가 끊긴 동안 관성 이동)
+  const velP = new THREE.Vector3()          // 선속도 (unit/s)
+  const velAxis = new THREE.Vector3(0, 1, 0) // 각속도 축
+  let velW = 0                               // 각속도 (rad/s)
+  const lastP = new THREE.Vector3()
+  const lastQ = new THREE.Quaternion()
+  let lastT = 0
+  let lastFrameT = 0
+  const tmpDq = new THREE.Quaternion()
+  const tmpQ2 = new THREE.Quaternion()
+  const MAX_V = 4, MAX_W = 8, MAX_DRIFT = 1.2
   const quadArea = (mg) => {
     mg.updateMatrixWorld()
     let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9
@@ -259,13 +279,13 @@ function setupMarkers(){
   }
   onRenderFcts.push(() => {
     const now = performance.now()
-    let pool = FACES.filter(f => markerGroups[f].visible)
-    const asym = pool.filter(f => ASYM_FACES.includes(f))
-    if(asym.length > 0) pool = asym
+    const dtF = Math.min(0.1, lastFrameT ? (now - lastFrameT) / 1000 : 0.016)
+    lastFrameT = now
     let n = 0, totalW = 0, best = 0, driver = null
+    let bestVis = -1, bestVisA = 0
     for(let i = 0; i < FACES.length; i++){
       const f = FACES[i]
-      if(!pool.includes(f)) continue
+      if(!markerGroups[f].visible) continue
       const mg = markerGroups[f]
       mg.updateMatrix()
       tmpM.compose(mg.position, mg.quaternion, mg.scale).multiply(markerToCubeInv[f])
@@ -274,16 +294,37 @@ function setupMarkers(){
       fuse[i].p.copy(tmpP)
       fuse[i].q.copy(tmpQ)
       fuse[i].a = a
+      fuse[i].ok = false
+      if(a > bestVisA){ bestVisA = a; bestVis = i }
+      const fb = faceBase[i]
+      let accept = true
+      if(fb.init && (now - fb.t) < 1000){
+        const dd = Math.abs(mg.quaternion.x * fb.q.x + mg.quaternion.y * fb.q.y + mg.quaternion.z * fb.q.z + mg.quaternion.w * fb.q.w)
+        if(2 * Math.acos(Math.min(1, dd)) > 75 * Math.PI / 180) accept = false
+      }
+      if(!accept) continue
+      fb.q.copy(mg.quaternion); fb.t = now; fb.init = true
+      fuse[i].ok = true
       totalW += a
       if(a > best){ best = a; driver = f }
       n++
+    }
+    if(n === 0 && bestVis >= 0){
+      const i = bestVis
+      fuse[i].ok = true
+      totalW = Math.max(fuse[i].a, 1e-6)
+      driver = FACES[i]
+      n = 1
+      faceBase[i].q.copy(markerGroups[FACES[i]].quaternion)
+      faceBase[i].t = now
+      faceBase[i].init = true
     }
     if(n > 0 && totalW > 0){
       fusedP.set(0, 0, 0)
       fusedQ.set(0, 0, 0, 0)
       const ref = fuse[FACES.indexOf(driver)].q
       for(let i = 0; i < FACES.length; i++){
-        if(fuse[i].a <= 0) continue
+        if(!fuse[i].ok) continue
         const w = fuse[i].a / totalW
         fusedP.addScaledVector(fuse[i].p, w)
         let s = 1
@@ -294,19 +335,72 @@ function setupMarkers(){
         fusedQ.w += s * w * fuse[i].q.w
       }
       fusedQ.normalize()
-      for(let i = 0; i < FACES.length; i++) fuse[i].a = 0
-      cubeGroup.position.copy(fusedP)
-      cubeGroup.quaternion.copy(fusedQ)
+      for(let i = 0; i < FACES.length; i++){ fuse[i].a = 0; fuse[i].ok = false }
+      if(!cubeGroup.visible){
+        cubeGroup.position.copy(fusedP)
+        cubeGroup.quaternion.copy(fusedQ)
+        blending = false
+      } else if(!wasDetected){
+        blendFromP.copy(cubeGroup.position)
+        blendFromQ.copy(cubeGroup.quaternion)
+        blendStart = now
+        blending = true
+      }
+      if(blending){
+        const bt = Math.min(1, (now - blendStart) / BLEND_MS)
+        const ba = bt * bt * (3 - 2 * bt)
+        cubeGroup.position.lerpVectors(blendFromP, fusedP, ba)
+        cubeGroup.quaternion.copy(blendFromQ).slerp(fusedQ, ba)
+        if(bt >= 1) blending = false
+      } else {
+        cubeGroup.position.copy(fusedP)
+        cubeGroup.quaternion.copy(fusedQ)
+      }
       cubeGroup.visible = true
       for(const m of faceMeshes) m.material.opacity = 1
+      wasDetected = true
+      // 속도 추정 (다음 가려짐 구간 예측용)
+      if(lastT > 0){
+        const dt = (now - lastT) / 1000
+        if(dt > 0.005 && dt < 0.5){
+          tmpV.copy(fusedP).sub(lastP).divideScalar(dt)
+          if(tmpV.length() < MAX_V) velP.lerp(tmpV, 0.35)
+          tmpDq.copy(lastQ).invert().multiply(fusedQ)
+          const ang = 2 * Math.acos(Math.min(1, Math.abs(tmpDq.w)))
+          if(ang > 1e-4 && ang / dt < MAX_W){
+            tmpV.set(tmpDq.x, tmpDq.y, tmpDq.z).normalize()
+            if(tmpDq.w < 0) tmpV.negate()
+            velAxis.lerp(tmpV, 0.35).normalize()
+            velW += (ang / dt - velW) * 0.35
+          } else if(ang <= 1e-4){
+            velW *= 0.9
+          }
+        }
+      }
+      lastP.copy(fusedP)
+      lastQ.copy(fusedQ)
+      lastT = now
       cubeLastSeen = now
     } else if(cubeGroup.visible){
       const age = now - cubeLastSeen
+      blending = false
+      wasDetected = false
       if(age > HOLD_MS){
         cubeGroup.visible = false
-      } else if(age > FADE_START){
-        const o = 1 - (age - FADE_START) / (HOLD_MS - FADE_START)
-        for(const m of faceMeshes) m.material.opacity = o
+      } else {
+        // 관성 예측 이동 (감쇠 포함) + 후반 fade-out
+        const k = Math.exp(-dtF / 0.6)
+        velP.multiplyScalar(k)
+        velW *= k
+        if(cubeGroup.position.distanceTo(lastP) < MAX_DRIFT){
+          cubeGroup.position.addScaledVector(velP, dtF)
+          tmpQ2.setFromAxisAngle(velAxis, velW * dtF)
+          cubeGroup.quaternion.premultiply(tmpQ2)
+        }
+        if(age > FADE_START){
+          const o = 1 - (age - FADE_START) / (HOLD_MS - FADE_START)
+          for(const m of faceMeshes) m.material.opacity = o
+        }
       }
     }
   })
@@ -459,6 +553,11 @@ async function startCamera(){
   }
   const profile = new ArToolkitProfile()
   profile.sourceWebcam()
+  // 4:3 고해상도 우선 요청 (ideal이므로 미지원 기기도 동작).
+  // 처리(640x480)와 화면 비율이 어긋나면(예: 16:9) 영상이 찌그러져서 인식 자세가 틀어짐.
+  // 아이폰 센서가 4:3이라 4:3을 요구하면 찌그러짐 없이 깨끗하게 축소 처리됨.
+  profile.sourceParameters.sourceWidth = 1280
+  profile.sourceParameters.sourceHeight = 960
   arToolkitSource = new ArToolkitSource(profile.sourceParameters)
   arToolkitSource.init(() => {
     const tryResize = () => {
@@ -502,6 +601,12 @@ function onResize(){
   arToolkitSource.copyElementSizeTo(renderer.domElement)
   if (arToolkitContext && arToolkitContext.arController !== null) {
     arToolkitSource.copyElementSizeTo(arToolkitContext.arController.canvas)
+  }
+  const v = arToolkitSource.domElement
+  if(v && v.videoWidth && !window._dimsShown){
+    window._dimsShown = true
+    const el = document.getElementById('detect')
+    if(el) el.textContent += ` | 영상:${v.videoWidth}x${v.videoHeight}`
   }
 }
 
